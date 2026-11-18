@@ -137,6 +137,18 @@ struct Flash_fwd_params : public Qkv_params {
     int window_size_left, window_size_right;
     int attention_chunk;
 
+    // sparse_rope block rule (0 = off): positions in rule blocks of sparse_rule_block tokens; for query block bi and
+    // key block bj, the first a_{bi - bj} RoPE pairs are dropped from Q K^T (all 32 if bi - bj >= sparse_n_table).
+    // sparse_a_ptr = [nd_1, nd_2, nd_3, nd_4, L_0, .., L_31, a_0, .., a_{n_table - 1}], nd_k = first distance with
+    // a >= 8 k (nd_4 = n_table), L_p = integer thresholds (pair p dropped iff dmin >= L_p). q / k come in chunked layout: features 16c .. 16c + 15 hold pairs 8c .. 8c + 7.
+    int const* sparse_a_ptr;
+    int sparse_n_table;
+    int sparse_rule_block;
+    // decode (sparse_kc_ptr[0] != nullptr): K as 4 ring buffers, one per 16-feature chunk, (b, R_c, h_k, 16)
+    // contiguous, R_c = sparse_kc_rows[c] (multiples of 128); V a ring (b, R_V, h_k, 64) given as k and v.
+    void const* sparse_kc_ptr[4];
+    int sparse_kc_rows[4];
+
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;
 
@@ -215,10 +227,11 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool Sparse=false>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+void run_mha_bwd_sparse_hdim64_bf16_sm90(Flash_bwd_params &params, cudaStream_t stream);  // sparse_rope block rule
 template <typename T, typename Tpartial, int kBlockK>
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);

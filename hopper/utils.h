@@ -324,6 +324,34 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// sparse_rope: SS gemm over the K blocks K0 .. end only (compile-time K0: a straight-line GMMA sequence; runtime
+// choices of K0 must be made outside the GMMA pipeline stage, see the block rule in mainloop_fwd_sm90_tma_gmma_ws.hpp).
+template <int K0, bool zero_init=false, int wg_wait=0, bool SwapAB=false, typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
+CUTLASS_DEVICE void gemm_from(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const& tCrB, Tensor2& tCrC) {
+    static_assert(cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value, "gemm_from: SS only");
+    static constexpr int kNumKIters = CUTE_STATIC_V(size<2>(tCrA));
+    static_assert(K0 < kNumKIters && kNumKIters <= 16);
+    warpgroup_fence_operand(tCrC);
+    warpgroup_arrive();
+    if constexpr (zero_init) {
+        tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_block = K0; k_block < kNumKIters; ++k_block) {
+        if constexpr (!SwapAB) {
+            cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
+        } else {
+            cute::gemm(tiled_mma, tCrB(_,_,k_block), tCrA(_,_,k_block), tCrC);
+        }
+        tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+    }
+    warpgroup_commit_batch();
+    if constexpr (wg_wait >= 0) { warpgroup_wait<wg_wait>(); }
+    warpgroup_fence_operand(tCrC);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template<bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false,
          typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,

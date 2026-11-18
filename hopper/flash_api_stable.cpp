@@ -434,6 +434,19 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
     STD_TORCH_CHECK(params.num_splits >= 1);
+    if (params.sparse_rule_block > 0) {  // sparse_rope block rule: own kernel (conditions checked in mha_fwd)
+        #if !defined(FLASHATTENTION_DISABLE_HDIM64)
+        if (params.sparse_kc_ptr[0] != nullptr) {  // decode from K chunk rings
+            if (params.num_splits > 1) {
+                return run_mha_fwd_<90, cutlass::bfloat16_t, 64, 64, true, true, false, true, true>(params, stream);
+            }
+            return run_mha_fwd_<90, cutlass::bfloat16_t, 64, 64, false, true, false, true, true>(params, stream);
+        }
+        return run_mha_fwd_<90, cutlass::bfloat16_t, 64, 64, false, false, false, false, true>(params, stream);
+        #else
+        STD_TORCH_CHECK(false, "sparse_rope block rule needs the head_dim 64 kernels");
+        #endif
+    }
     ARCH_SWITCH(params.arch, Arch, [&] {
         SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
             PAGEDKV_SWITCH(params.page_table && !params.pagedkv_tma, PagedKVNonTMA, [&] {
@@ -477,6 +490,11 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
     #endif
 }
 
+// K / V loaded with cp.async (paged KV without TMA, or the sparse_rope decode kernel): kBlockN as in the kernel
+inline bool kv_non_tma(Flash_fwd_params const& params) {
+    return (params.page_table && !params.pagedkv_tma) || params.sparse_kc_ptr[0] != nullptr;
+}
+
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
     if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr) { return false; }
     // This needs to match the kernel configs
@@ -491,14 +509,14 @@ inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
 inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation and binary size.
     // Has little effect on speed.
-    if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
+    if (params.arch < 90 || kv_non_tma(params) || params.num_splits > 1) { return true; }
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
     return false;
     #else
     // params.page_table must already be set
     if (params.h == params.h_k) { return false; }
     // This needs to match the kernel configs
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, kv_non_tma(params), params.softcap > 0.f, params.sparse_kc_ptr[0] != nullptr);
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
     #endif
@@ -512,7 +530,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // params.page_table must already be set
     // This needs to match the kernel configs
     bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, kv_non_tma(params), params.softcap > 0.f, params.sparse_kc_ptr[0] != nullptr);
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
@@ -716,7 +734,7 @@ mha_fwd_get_scheduler_metadata(
     }
 
     if (use_prepare_varlen) {
-        auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+        auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, kv_non_tma(params), params.softcap > 0.f, params.sparse_kc_ptr[0] != nullptr);
         auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
@@ -773,7 +791,13 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         std::optional<Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<Tensor> sparse_a_,  // sparse_rope: int32 (n_table,) pairs dropped per rule-block distance
+        int64_t sparse_rule_block,
+        // sparse_rope decode: K as 4 ring buffers (b, R_c, h_k, 16), one per 16-feature chunk; k and v are then the
+        // V ring (b, R_V, h_k, 64) (k only gives shapes); seqused_k = cache lengths; seqlen_q = 1
+        std::optional<Tensor> sparse_kc0_, std::optional<Tensor> sparse_kc1_,
+        std::optional<Tensor> sparse_kc2_, std::optional<Tensor> sparse_kc3_
         ) {
 
     auto dprops = get_device_prop();
@@ -1047,9 +1071,59 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
+    // sparse_rope decode: K chunk rings (set before the split heuristics, which depend on kBlockN)
+    bool const sparse_decode = sparse_kc0_.has_value();
+    if (sparse_decode) {
+        std::optional<Tensor> const* kcs[4] = {&sparse_kc0_, &sparse_kc1_, &sparse_kc2_, &sparse_kc3_};
+        for (int c = 0; c < 4; ++c) {
+            STD_TORCH_CHECK(kcs[c]->has_value(), "sparse_rope decode: sparse_kc0 .. sparse_kc3 all needed");
+            auto kc = kcs[c]->value();
+            CHECK_DEVICE(kc);
+            STD_TORCH_CHECK(kc.scalar_type() == q_type && kc.is_contiguous() && kc.dim() == 4 && kc.size(0) == batch_size
+                            && kc.size(2) == num_heads_k && kc.size(3) == 16 && kc.size(1) % 128 == 0,
+                            "sparse_rope decode: K chunk ring c must be contiguous (b, R_c, h_k, 16), R_c a multiple of 128");
+            params.sparse_kc_ptr[c] = kc.data_ptr();
+            params.sparse_kc_rows[c] = static_cast<int>(kc.size(1));
+        }
+        STD_TORCH_CHECK(params.seqlen_q == 1 && seqused_k_.has_value() && !cu_seqlens_q_.has_value() && !cu_seqlens_k_.has_value()
+                        && !leftpad_k_.has_value(), "sparse_rope decode: seqlen_q 1, cache lengths in seqused_k, no cu_seqlens / leftpad");
+        STD_TORCH_CHECK(v.is_contiguous() && v.size(1) % 128 == 0, "sparse_rope decode: V ring contiguous, R_V a multiple of 128");
+        STD_TORCH_CHECK(sparse_rule_block == 128, "sparse_rope decode: rule block 128 (= kBlockN)");
+        STD_TORCH_CHECK(!params.is_causal, "sparse_rope decode: seqlen_q 1 (not causal)");
+    }
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    if (sparse_decode) { params.pack_gqa = true; }
+
+    // sparse_rope block rule
+    params.sparse_rule_block = 0;
+    params.sparse_a_ptr = nullptr;
+    params.sparse_n_table = 0;
+    if (sparse_rule_block > 0) {
+        STD_TORCH_CHECK(sparse_a_.has_value(), "sparse_rule_block > 0 needs sparse_a");
+        auto sparse_a = sparse_a_.value();
+        STD_TORCH_CHECK(sparse_a.scalar_type() == torch::headeronly::ScalarType::Int, "sparse_a must be int32");
+        STD_TORCH_CHECK(sparse_a.is_contiguous() && sparse_a.dim() == 1 && sparse_a.size(0) >= 36,
+                        "sparse_a must be a contiguous 1-D tensor [nd_1, .., nd_4, L_0, .., L_31, a_0, ..]");
+        CHECK_DEVICE(sparse_a);
+        STD_TORCH_CHECK(params.arch == 90 && params.d == 64 && params.dv == 64 && q_type == torch::headeronly::ScalarType::BFloat16,
+                        "sparse_rope block rule: sm90, head_dim 64, bf16 only");
+        if (!sparse_decode) {
+            STD_TORCH_CHECK(params.is_causal || params.is_local, "sparse_rope block rule: causal attention only");
+            STD_TORCH_CHECK(!is_varlen && !params.page_table && !k_new_.has_value() && !q_v_.has_value(),
+                            "sparse_rope block rule: no varlen / paged KV / append KV / qv");
+            STD_TORCH_CHECK(params.num_splits == 1 && !params.pack_gqa && params.softcap == 0.0,
+                            "sparse_rope block rule: num_splits 1, pack_gqa False, no softcap");
+        } else {
+            STD_TORCH_CHECK(!params.page_table && !k_new_.has_value() && !q_v_.has_value() && params.softcap == 0.0,
+                            "sparse_rope decode: no paged KV / append KV / qv / softcap");
+        }
+        STD_TORCH_CHECK(sparse_rule_block % 128 == 0, "sparse_rope block rule: rule block must be a multiple of 128 (kBlockN)");
+        params.sparse_rule_block = static_cast<int>(sparse_rule_block);
+        params.sparse_a_ptr = static_cast<int const*>(sparse_a.data_ptr());
+        params.sparse_n_table = static_cast<int>(sparse_a.size(0)) - 36;
+    }
 
     // This needs to be set after get_num_splits
     Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
@@ -1222,7 +1296,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     STD_TORCH_CHECK(params.num_splits == 1, "This flash attention build does not support splits.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
-    STD_TORCH_CHECK(!params.pack_gqa || params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1, "This flash attention build does not support pack_gqa.");
+    STD_TORCH_CHECK(!params.pack_gqa || params.arch < 90 || kv_non_tma(params) || params.num_splits > 1, "This flash attention build does not support pack_gqa.");
     #endif
     #ifdef FLASHATTENTION_DISABLE_PAGEDKV
     STD_TORCH_CHECK(!(params.page_table && !params.pagedkv_tma), "This flash attention build does not support paged KV.");
@@ -1315,6 +1389,13 @@ void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+    if (params.sparse_rule_block > 0) {  // sparse_rope block rule: own kernel (conditions checked in mha_bwd)
+        #if !defined(FLASHATTENTION_DISABLE_HDIM64)
+        return run_mha_bwd_sparse_hdim64_bf16_sm90(params, stream);
+        #else
+        STD_TORCH_CHECK(false, "sparse_rope block rule needs the head_dim 64 kernels");
+        #endif
+    }
         // FP16_SWITCH(!params.is_bf16, [&] {
         //     HEADDIM_SWITCH(params.d, [&] {
         //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
@@ -1357,7 +1438,9 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     int64_t window_size_right,
     double softcap,
     bool deterministic,
-    int64_t sm_margin
+    int64_t sm_margin,
+    std::optional<Tensor> sparse_a_,  // sparse_rope block rule: same table as the forward
+    int64_t sparse_rule_block
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1626,6 +1709,27 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     STD_TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
     #endif
 
+    // sparse_rope block rule
+    params.sparse_rule_block = 0;
+    params.sparse_a_ptr = nullptr;
+    params.sparse_n_table = 0;
+    if (sparse_rule_block > 0) {
+        STD_TORCH_CHECK(sparse_a_.has_value(), "sparse_rule_block > 0 needs sparse_a");
+        auto sparse_a = sparse_a_.value();
+        STD_TORCH_CHECK(sparse_a.scalar_type() == torch::headeronly::ScalarType::Int && sparse_a.is_contiguous()
+                        && sparse_a.dim() == 1 && sparse_a.size(0) >= 36, "sparse_a: int32 [nd_1..4, L_0..31, a_0, ..]");
+        CHECK_DEVICE(sparse_a);
+        STD_TORCH_CHECK(params.arch == 90 && params.d == 64 && params.dv == 64 && params.is_bf16,
+                        "sparse_rope block rule: sm90, head_dim 64, bf16 only");
+        STD_TORCH_CHECK(params.is_causal || params.is_local, "sparse_rope block rule: causal attention only");
+        STD_TORCH_CHECK(!is_varlen && !params.deterministic && params.softcap == 0.0,
+                        "sparse_rope block rule: no varlen / deterministic / softcap");
+        STD_TORCH_CHECK(sparse_rule_block % 128 == 0, "sparse_rope block rule: rule block must be a multiple of 128");
+        params.sparse_rule_block = static_cast<int>(sparse_rule_block);
+        params.sparse_a_ptr = static_cast<int const*>(sparse_a.data_ptr());
+        params.sparse_n_table = static_cast<int>(sparse_a.size(0)) - 36;
+    }
+
     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
         auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
         void* stream_ptr = nullptr;
@@ -1791,8 +1895,14 @@ void boxed_mha_fwd(
     auto num_splits = to<int64_t>(stack[31]);
     auto pack_gqa = to<std::optional<bool>>(stack[32]);
     auto sm_margin = to<int64_t>(stack[33]);
+    auto sparse_a = to<std::optional<Tensor>>(stack[34]);
+    auto sparse_rule_block = to<int64_t>(stack[35]);
+    auto sparse_kc0 = to<std::optional<Tensor>>(stack[36]);
+    auto sparse_kc1 = to<std::optional<Tensor>>(stack[37]);
+    auto sparse_kc2 = to<std::optional<Tensor>>(stack[38]);
+    auto sparse_kc3 = to<std::optional<Tensor>>(stack[39]);
 
-    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin);
+    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, sparse_a, sparse_rule_block, sparse_kc0, sparse_kc1, sparse_kc2, sparse_kc3);
 
 
     stack[0] = from(out_);
@@ -1828,8 +1938,10 @@ void boxed_mha_bwd(
     auto softcap = to<double>(stack[19]);
     auto deterministic = to<bool>(stack[20]);
     auto sm_margin = to<int64_t>(stack[21]);
+    auto sparse_a = to<std::optional<Tensor>>(stack[22]);
+    auto sparse_rule_block = to<int64_t>(stack[23]);
 
-    auto [softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin);
+    auto [softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin, sparse_a, sparse_rule_block);
 
     stack[0] = from(softmax_d);
     stack[1] = from(softmax_lse_log2);
@@ -1924,7 +2036,13 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? sparse_a = None,"
+        "int sparse_rule_block = 0,"
+        "Tensor? sparse_kc0 = None,"
+        "Tensor? sparse_kc1 = None,"
+        "Tensor? sparse_kc2 = None,"
+        "Tensor? sparse_kc3 = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -1947,7 +2065,9 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "int window_size_right = -1,"
         "float softcap = 0.0,"
         "bool deterministic = False,"
-        "int sm_margin = 0) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? sparse_a = None,"
+        "int sparse_rule_block = 0) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"

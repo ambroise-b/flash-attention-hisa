@@ -23,6 +23,7 @@
 #include "rotary.h"
 #include "utils.h"
 #include "sm90_pipeline_no_cluster.hpp"
+#include "sparse_kv.h"
 
 namespace flash {
 
@@ -30,10 +31,19 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Sparse_=false>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
+    // sparse_rope block rule: a separate kernel (instantiations/flash_fwd_hdim64_bf16_sparse_sm90.cu), so the dense
+    // kernels contain none of its code
+    static constexpr bool Sparse = Sparse_;
+    // Decode variant (PagedKVNonTMA): one query position per sequence (seqlen_q = 1, host-checked), q heads packed
+    // (PackGQA), K / V from per-chunk ring buffers through SparseKVManager (sparse_kv.h) instead of PagedKVManager.
+    static constexpr bool SparseDecode = Sparse_ && PagedKVNonTMA_;
+    static_assert(!Sparse_ || (IntraWGOverlap && !AppendKV_ && !HasQv_ && !Has_softcap_
+                               && (SparseDecode ? PackGQA_ : (!PackGQA_ && !Split_))),
+                  "sparse_rope block rule: IntraWGOverlap path, no AppendKV / Qv / softcap; PackGQA / Split only in decode");
     using ClusterShape = ClusterShape_;
     using TileShape_MNK = TileShape_MNK_;
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
@@ -396,6 +406,14 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        int const* const sparse_a = nullptr;  // sparse_rope block rule (see Flash_fwd_params)
+        int const sparse_n_table = 0;
+        int const sparse_rule_block = 0;
+        Element const* const sparse_kc0 = nullptr;  // decode: K chunk rings (b, R_c, h_k, 16), see sparse_kv.h
+        Element const* const sparse_kc1 = nullptr;
+        Element const* const sparse_kc2 = nullptr;
+        Element const* const sparse_kc3 = nullptr;
+        int const sparse_kc_rows0 = 0, sparse_kc_rows1 = 0, sparse_kc_rows2 = 0, sparse_kc_rows3 = 0;
     };
 
     // Device side kernel params
@@ -453,6 +471,14 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
+        int const* const sparse_a = nullptr;
+        int const sparse_n_table = 0;
+        int const sparse_rule_block = 0;
+        Element const* const sparse_kc0 = nullptr;
+        Element const* const sparse_kc1 = nullptr;
+        Element const* const sparse_kc2 = nullptr;
+        Element const* const sparse_kc3 = nullptr;
+        int const sparse_kc_rows0 = 0, sparse_kc_rows1 = 0, sparse_kc_rows2 = 0, sparse_kc_rows3 = 0;
     };
 
     static Params
@@ -564,7 +590,10 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.sparse_a, args.sparse_n_table, args.sparse_rule_block,
+                args.sparse_kc0, args.sparse_kc1, args.sparse_kc2, args.sparse_kc3,
+                args.sparse_kc_rows0, args.sparse_kc_rows1, args.sparse_kc_rows2, args.sparse_kc_rows3};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -691,13 +720,25 @@ struct CollectiveMainloopFwdSm90 {
         int const bidb_kv_idx = !is_varlen_k && !params.ptr_pagetable ? bidb_kv : 0;
 
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>;
-        PagedKVManager_t paged_kv_manager(
-            params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
-            params.ptr_K, params.shape_K, params.stride_K,
-            params.ptr_V, params.headdim_v, params.stride_V,
-            params.page_size_divmod, params.blockN_per_page_size_divmod,
-            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k, bidb_kv_idx
-        );
+        auto paged_kv_manager = [&] {
+            if constexpr (!SparseDecode) {
+                return PagedKVManager_t(
+                    params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
+                    params.ptr_K, params.shape_K, params.stride_K,
+                    params.ptr_V, params.headdim_v, params.stride_V,
+                    params.page_size_divmod, params.blockN_per_page_size_divmod,
+                    bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k, bidb_kv_idx
+                );
+            } else {  // sparse_rope decode: K chunk rings + V ring (sparse_kv.h)
+                Element const* kc[4] = {params.sparse_kc0, params.sparse_kc1, params.sparse_kc2, params.sparse_kc3};
+                int const kc_rows[4] = {params.sparse_kc_rows0, params.sparse_kc_rows1, params.sparse_kc_rows2, params.sparse_kc_rows3};
+                return SparseKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element>(
+                    kc, kc_rows, get<2>(params.shape_K),
+                    params.ptr_V, get<0>(params.shape_K), get<0>(params.stride_V), get<3>(params.stride_V),
+                    params.sparse_a, params.sparse_rule_block,
+                    bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k);
+            }
+        }();
 
         // Set up for transposing V, only used if Transpose_V
         S2RTiledCopyVt s2r_tiled_copy_vt;
@@ -1135,11 +1176,86 @@ struct CollectiveMainloopFwdSm90 {
             cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
         }
 
+        // ---- sparse_rope block rule (params.sparse_rule_block > 0, host-checked: causal, hdim 64, no PackGQA) ----
+        // Each MMA warpgroup owns 64 query rows (AtomLayoutQK), which lie in one rule block. For key block n_block,
+        // the first a pairs are dropped: chunks (16 features = 8 pairs) below a / 8 are not multiplied, and the
+        // pairs [8 (a / 8), a) of chunk a / 8 are zeroed in this warpgroup's rows of sQ. The n_block loop runs
+        // near -> far, so a never decreases and the zeroing is cumulative. a = 32: no pair kept, scores -inf.
+        // params.sparse_a = [nd_1, nd_2, nd_3, nd_4, L_0 .. L_31, a_0, a_1, ..]: a_nd = pairs dropped at rule-block
+        // distance nd (nd < nd_4 = table length), nd_k = first distance with a >= 8 k (nd_4: no pair kept), L_p the
+        // integer thresholds (pair p dropped iff dmin >= L_p). The chunk count K0 of a key block follows from nd_1..4;
+        // inside a K0 segment, a = 8 K0 + #{j : L_{8 K0 + j} <= dmin} with the 8 thresholds held in registers
+        // (loaded once per segment): no memory access per step.
+        int const sp_rb = Sparse ? params.sparse_rule_block : 1;
+        // decode: every (packed) query row is the last position seqlen_k - 1
+        int const sp_bi = !Sparse ? 0 : SparseDecode ? (seqlen_info.seqlen_k - 1) / sp_rb : (m_block * kBlockM + warp_group_idx * 64) / sp_rb;
+        int sp_nd1 = 0, sp_nd2 = 0, sp_nd3 = 0, sp_nd4 = 0;
+        if constexpr (Sparse) {
+            sp_nd1 = __ldg(params.sparse_a); sp_nd2 = __ldg(params.sparse_a + 1);
+            sp_nd3 = __ldg(params.sparse_a + 2); sp_nd4 = __ldg(params.sparse_a + 3);
+        }
+        int sp_zeroed = 0;
+        Tensor sQ_sp = cute::as_position_independent_swizzle_tensor(sQ);
+        auto sp_nd = [&](int nb) { return max(sp_bi - (nb * kBlockN) / sp_rb, 0); };
+        auto sp_dropped = [&](int nb) {
+            int const nd = sp_nd(nb);
+            return nd < sp_nd4 ? __ldg(params.sparse_a + 36 + nd) : 32;
+        };
+        auto sp_k0 = [&](int nb) {
+            int const nd = sp_nd(nb);
+            return int(nd >= sp_nd1) + int(nd >= sp_nd2) + int(nd >= sp_nd3) + int(nd >= sp_nd4);
+        };
+        // Each warp zeroes the dropped pairs in its own 16 rows of sQ (the rows of its GMMA outputs), then
+        // fence + syncwarp: the pattern FA3 uses for P in smem (write_P_to_smem / arrive_on_P_write_barrier).
+        int const sp_row0 = warp_group_idx * 64 + ((thread_idx % cutlass::NumThreadsPerWarpGroup) / cutlass::NumThreadsPerWarp) * 16;
+        auto sp_prepare_q = [&](int a) {
+            int const lo = max(sp_zeroed, (a / 8) * 8);
+            if (a < 32 && a > lo) {  // uniform over the warpgroup
+                int const n_cols = 2 * (a - lo);
+                for (int idx = thread_idx % cutlass::NumThreadsPerWarp; idx < 16 * n_cols; idx += cutlass::NumThreadsPerWarp) {
+                    int const r = idx / n_cols, ci = idx % n_cols, p = lo + ci / 2;
+                    sQ_sp(sp_row0 + r, 16 * (p / 8) + (ci & 1) * 8 + p % 8) = Element(0);
+                }
+                cutlass::arch::fence_view_async_shared();  // generic-proxy writes -> visible to GMMA
+                __syncwarp();
+            }
+            sp_zeroed = max(sp_zeroed, a);
+        };
+        int sp_Lc[8];  // thresholds of the pairs of the current segment's boundary chunk
+        auto sp_load_chunk = [&](int c) {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) { sp_Lc[j] = c < 4 ? __ldg(params.sparse_a + 4 + 8 * c + j) : 0; }
+        };
+        auto sp_dropped_in_segment = [&](int nb, int c) {  // = sp_dropped(nb) for a key block of segment K0 = c < 4
+            int const dmin = max(sp_nd(nb) * sp_rb - sp_rb + 1, 0);
+            int a = 8 * c;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) { a += int(sp_Lc[j] <= dmin); }
+            return a;
+        };
+
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+            int sp_a = 0;
+            if constexpr (Sparse) { sp_a = sp_dropped(n_block); sp_prepare_q(sp_a); }
             consumer_wait(pipeline_k, smem_pipe_read);
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
-            warpgroup_wait<0>();
+            if constexpr (!Sparse) {
+                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                warpgroup_wait<0>();
+            } else {   // every branch closes its GMMA stage (wg_wait = 0) before the paths merge
+                int const k0 = sp_a >= 32 ? 4 : sp_a / 8;
+                if (k0 == 0) {
+                    flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                } else if (k0 == 1) {
+                    flash::gemm_from<1, /*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                } else if (k0 == 2) {
+                    flash::gemm_from<2, /*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                } else if (k0 == 3) {
+                    flash::gemm_from<3, /*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                } else {
+                    cute::fill(tSrS, -INFINITY);
+                }
+            }
             pipeline_k.consumer_release(smem_pipe_read);
             if constexpr (HasQv) {
                 shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
@@ -1167,14 +1283,27 @@ struct CollectiveMainloopFwdSm90 {
             // tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
 
             // Each step does gemm0 for iter n_block, gemm1 for iter n_block + 1, and softmax for iter n_block.
-            auto fwd_step = [&](int const n_block, auto mask_fn, auto check_inf_type) {
+            // K0 (compile time): first computed chunk of Q K^T (block rule); 4 = no pair kept, scores -inf
+            // always_inline: with one copy per K0 the compiler otherwise outlines the step and moves the register
+            // fragments (passed by reference) to local memory (~900-byte stack frames, ~9x slower)
+            auto fwd_step = [&](int const n_block, auto mask_fn, auto check_inf_type, auto k0_type) __attribute__((always_inline)) {
                 static constexpr bool Check_inf = decltype(check_inf_type)::value;
+                static constexpr int K0 = decltype(k0_type)::value;
                 PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
                 ++smem_pipe_read;
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+                #ifndef SPARSE_ROPE_EXP_NO_BOOKKEEPING
+                if constexpr (Sparse && K0 < 4) {  // QK of the previous step is done
+                    sp_prepare_q(sp_dropped_in_segment(n_block, K0));
+                }
+                #endif
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                if constexpr (K0 == 0) {
+                    flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                } else if constexpr (K0 < 4) {
+                    flash::gemm_from<K0, /*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                }
                 if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr(!HasQv) {
                     if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
@@ -1182,6 +1311,7 @@ struct CollectiveMainloopFwdSm90 {
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<1>();
+                if constexpr (K0 == 4) { cute::fill(tSrS, -INFINITY); }
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
                 if constexpr (HasQv) {
                     warpgroup_wait<0>();
@@ -1206,32 +1336,52 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             };
 
+            // Steps n_block .. n_block_end (descending). Block rule: K0 never decreases along the loop (far blocks drop
+            // more pairs), so the steps split into straight segments, one per K0, with no branch around the GMMAs.
+            auto run_steps = [&](int const n_block_end, auto mask_fn, auto check_inf_type) __attribute__((always_inline)) {
+                if constexpr (!Sparse) {
+                    #pragma unroll 1
+                    for (; n_block >= n_block_end; --n_block) { fwd_step(n_block, mask_fn, check_inf_type, cute::Int<0>{}); }
+                } else {
+                    #ifdef SPARSE_ROPE_EXP_ONLY_K0_0
+                    #pragma unroll 1
+                    for (; n_block >= n_block_end; --n_block) { fwd_step(n_block, mask_fn, check_inf_type, cute::Int<0>{}); }
+                    return;
+                    #endif
+                    if (n_block >= n_block_end && sp_k0(n_block) == 0) { sp_load_chunk(0); }
+                    #pragma unroll 1
+                    for (; n_block >= n_block_end && sp_k0(n_block) == 0; --n_block) { fwd_step(n_block, mask_fn, check_inf_type, cute::Int<0>{}); }
+                    if (n_block >= n_block_end && sp_k0(n_block) == 1) { sp_load_chunk(1); }
+                    #pragma unroll 1
+                    for (; n_block >= n_block_end && sp_k0(n_block) == 1; --n_block) { fwd_step(n_block, mask_fn, check_inf_type, cute::Int<1>{}); }
+                    if (n_block >= n_block_end && sp_k0(n_block) == 2) { sp_load_chunk(2); }
+                    #pragma unroll 1
+                    for (; n_block >= n_block_end && sp_k0(n_block) == 2; --n_block) { fwd_step(n_block, mask_fn, check_inf_type, cute::Int<2>{}); }
+                    if (n_block >= n_block_end && sp_k0(n_block) == 3) { sp_load_chunk(3); }
+                    #pragma unroll 1
+                    for (; n_block >= n_block_end && sp_k0(n_block) == 3; --n_block) { fwd_step(n_block, mask_fn, check_inf_type, cute::Int<3>{}); }
+                    #pragma unroll 1
+                    for (; n_block >= n_block_end; --n_block) { fwd_step(n_block, mask_fn, check_inf_type, cute::Int<4>{}); }
+                }
+            };
+
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
                 int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
                     seqlen_info, m_block, n_block_min, params.window_size_right,
                     params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-                #pragma unroll 1
-                for (; n_block >= n_block_min_causal_local_mask; --n_block) {
-                    fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
-                }
+                run_steps(n_block_min_causal_local_mask, mask_fn, cute::true_type{} /*check_inf*/);
             }
 
             int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
                 seqlen_info, m_block, n_block_min, params.window_size_left,
                 params.attention_chunk_divmod, params.qhead_per_khead_divmod);
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
-            #pragma unroll 1
-            for (; n_block >= n_block_min_before_local_mask; --n_block) {
-                fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
-            }
+            run_steps(n_block_min_before_local_mask, no_mask_fn, cute::false_type{} /*check_inf*/);
             // Separate masking iterations on the left for local attention
             if constexpr (Is_local) {
                 auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
-                #pragma unroll 1
-                for (; n_block >= n_block_min; --n_block) {
-                    fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
-                }
+                run_steps(n_block_min, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
             }
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);

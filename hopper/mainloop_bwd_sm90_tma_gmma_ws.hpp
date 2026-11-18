@@ -31,10 +31,12 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-        bool Mma_dP_is_RS=false>
+        bool Mma_dP_is_RS=false, bool Sparse_=false>
 struct CollectiveMainloopBwdSm90 {
 
     static constexpr int kStages = Stages;
+    // sparse_rope block rule (separate kernel, instantiations/flash_bwd_hdim64_bf16_sparse_sm90.cu)
+    static constexpr bool Sparse = Sparse_;
     static constexpr int kStages_dO = Stages_dO;
     static constexpr int kStages_dS = Stages_dS;
     static_assert(kStages >= kStages_dO);
@@ -320,6 +322,9 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        int const* const sparse_a = nullptr;  // sparse_rope block rule (see Flash_fwd_params)
+        int const sparse_n_table = 0;
+        int const sparse_rule_block = 0;
     };
 
     // Device side kernel params
@@ -350,6 +355,9 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        int const* const sparse_a = nullptr;
+        int const sparse_n_table = 0;
+        int const sparse_rule_block = 0;
     };
 
     static Params
@@ -406,7 +414,8 @@ struct CollectiveMainloopBwdSm90 {
                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
+                args.sparse_a, args.sparse_n_table, args.sparse_rule_block};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -831,10 +840,71 @@ struct CollectiveMainloopBwdSm90 {
             cute::copy(smem_tiled_copy_V, tdPsV_copy_view, tdPrV_copy_view);
         }
 
-        auto bwd_step = [&](int m_block, auto mask_fn) {
+        // ---- sparse_rope block rule (Sparse; host-checked: hdim 64, causal / local, no varlen / softcap) ----
+        // A step (query block m_block x key block n_block) lies in one rule-block pair (kBlockM = kBlockN = rule block
+        // or a divisor of it), so a = pairs dropped is uniform over the step and both warpgroups. Stage 1 (exact):
+        //   - the dropped pairs' columns of the Q tile are zeroed in smem (both warpgroups, then a barrier): S^T and
+        //     dK = dS^T Q get no contribution from them;
+        //   - a = 32 (no pair kept): scores -inf, so P = dS = 0;
+        //   - dQ = dS K: the dropped columns are zeroed in registers before the dQ accumulation.
+        static_assert(!Sparse || (kHeadDim == 64 && SdP_swapAB && !dQ_swapAB && NumMmaWarpGroups == 2 && !Has_softcap
+                                  && !Varlen && !Deterministic), "sparse_rope block rule: hdim-64 bwd configuration only");
+        Tensor sQ_sp = cute::as_position_independent_swizzle_tensor(sQ);
+        auto sp_dropped = [&](int mb) {
+            int const nd = max((mb * kBlockM) / params.sparse_rule_block - (n_block * kBlockN) / params.sparse_rule_block, 0);
+            return nd < params.sparse_n_table ? __ldg(params.sparse_a + 36 + nd) : 32;
+        };
+        int sp_nd1 = 0, sp_nd2 = 0, sp_nd3 = 0, sp_nd4 = 0;
+        if constexpr (Sparse) {
+            sp_nd1 = __ldg(params.sparse_a); sp_nd2 = __ldg(params.sparse_a + 1);
+            sp_nd3 = __ldg(params.sparse_a + 2); sp_nd4 = __ldg(params.sparse_a + 3);
+        }
+        auto sp_k0 = [&](int mb) {  // number of 16-feature chunks dropped for query block mb (4: no pair kept)
+            int const nd = max((mb * kBlockM) / params.sparse_rule_block - (n_block * kBlockN) / params.sparse_rule_block, 0);
+            return int(nd >= sp_nd1) + int(nd >= sp_nd2) + int(nd >= sp_nd3) + int(nd >= sp_nd4);
+        };
+        // Zero pairs 0 .. a - 1 (chunks < K0 whole, with 16-byte stores; pairs 8 K0 .. a - 1 of chunk K0 one by one)
+        // of the Q tile in this stage, then a barrier: both warpgroups read the whole Q tile (dK = dS^T Q).
+        auto sp_zero_q = [&](int a, int stage, auto k0_type) {
+            static constexpr int K0 = decltype(k0_type)::value;
+            if constexpr (K0 > 0) {
+                #pragma unroll
+                for (int idx = thread_idx; idx < kBlockM * 2 * K0; idx += NumMmaThreads) {
+                    int const r = idx / (2 * K0), h = idx % (2 * K0);  // h: 8-feature half h % 2 of chunk h / 2
+                    *reinterpret_cast<uint4*>(&sQ_sp(r, 16 * (h / 2) + 8 * (h % 2), stage)) = make_uint4(0, 0, 0, 0);
+                }
+            }
+            int const n_part = a - 8 * K0;  // dropped pairs inside chunk K0
+            if (n_part > 0) {
+                for (int idx = thread_idx; idx < kBlockM * 2 * n_part; idx += NumMmaThreads) {
+                    int const r = idx / (2 * n_part), ci = idx % (2 * n_part);
+                    sQ_sp(r, 16 * K0 + (ci & 1) * 8 + ci / 2, stage) = Element(0);
+                }
+            }
+            cutlass::arch::fence_view_async_shared();  // generic-proxy writes -> visible to GMMA
+            // id dQEmptyWG3 is unused with 2 MMA warpgroups
+            cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG3) /*id*/);
+        };
+        auto thread_mma_dQ_sp = tiled_mma_dQ.get_thread_slice(thread_idx);
+        Tensor tdQcdQ_sp = thread_mma_dQ_sp.partition_C(cute::make_identity_tensor(select<0, 2>(TileShape_MNK{})));
+
+        // K0 (compile time): first computed chunk of S^T (block rule), 4 = no pair kept; 0 for the dense kernel
+        auto bwd_step = [&](int m_block, auto mask_fn, auto k0_type) __attribute__((always_inline)) {
+            static constexpr int K0 = decltype(k0_type)::value;
             Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             consumer_wait(pipeline_q, smem_pipe_read);
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tSrQ(_, _, _, smem_pipe_read.index()), tSrK, tSrS);
+            int sp_a = 0;
+            if constexpr (Sparse) {
+                sp_a = K0 < 4 ? sp_dropped(m_block) : 32;
+                if constexpr (K0 < 4) {
+                    if (sp_a > 0) { sp_zero_q(sp_a, smem_pipe_read.index(), k0_type); }  // uniform over the CTA
+                }
+            }
+            if constexpr (K0 == 0) {
+                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tSrQ(_, _, _, smem_pipe_read.index()), tSrK, tSrS);
+            } else if constexpr (K0 < 4) {  // skip the dropped chunks (their Q columns are zero anyway)
+                flash::gemm_from<K0, /*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tSrQ(_, _, _, smem_pipe_read.index()), tSrK, tSrS);
+            }
             Tensor tLSErLSE = cute::conditional_return<!ShuffleLSE>(make_fragment_like(tLSEsLSE(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
             if constexpr (!ShuffleLSE) {
                 cute::copy(tLSEsLSE(_, smem_pipe_read.index()), tLSErLSE);
@@ -850,6 +920,7 @@ struct CollectiveMainloopBwdSm90 {
             consumer_wait(pipeline_do, smem_pipe_read_do_cur);
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_dP, tdPrdO(_, _, _, smem_pipe_read_do_cur.index()), tdPrV, tdPrdP);
             warpgroup_wait<1>();
+            if constexpr (K0 == 4) { cute::fill(tSrS, -INFINITY); }
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, params.softcap_val); }
 
             // Reshape tSrS from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V, MMA_M), ncol=(2, MMA_N))
@@ -948,6 +1019,15 @@ struct CollectiveMainloopBwdSm90 {
                     Tensor tdKrdS_cur = tdKrdS(_, _, _, cute::conditional_return<kStages_dS==1>(_0{}, smem_pipe_read.index()));
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/1, /*SwapAB=*/dKV_swapAB>(tiled_mma_dKV, tdKrdS_cur, tdKrQ(_, _, _, smem_pipe_read.index()), tdKrdK);
                 }
+                if constexpr (Sparse) {  // dQ is complete here (only the dK GEMM may be in flight)
+                    if (sp_a > 0 && sp_a < 32) {
+                        #pragma unroll
+                        for (int i = 0; i < size(tdQrdQ); ++i) {
+                            int const col = get<1>(tdQcdQ_sp(i));
+                            if (8 * (col / 16) + col % 8 < sp_a) { tdQrdQ(i) = 0.f; }
+                        }
+                    }
+                }
                 if constexpr (dQacc_use_TMA) {
                     int const warp_group_idx = flash::canonical_warp_group_idx_nosync() - 1;
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warp_group_idx /*id*/);  // sdQ full, to be written to gmem
@@ -1000,16 +1080,33 @@ struct CollectiveMainloopBwdSm90 {
             if constexpr (!Q_dO_same_stages) { ++smem_pipe_read_do; }
         };
 
+        // Steps m_block .. m_end - 1. Block rule: K0 never decreases along the loop (far query blocks drop more pairs),
+        // so the steps split into straight segments, one per K0, with no branch around the GMMAs.
+        auto run_steps = [&](int const m_end, auto mask_fn) __attribute__((always_inline)) {
+            if constexpr (!Sparse) {
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < m_end; ++m_block) { bwd_step(m_block, mask_fn, cute::Int<0>{}); }
+            } else {
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < m_end && sp_k0(m_block) == 0; ++m_block) { bwd_step(m_block, mask_fn, cute::Int<0>{}); }
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < m_end && sp_k0(m_block) == 1; ++m_block) { bwd_step(m_block, mask_fn, cute::Int<1>{}); }
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < m_end && sp_k0(m_block) == 2; ++m_block) { bwd_step(m_block, mask_fn, cute::Int<2>{}); }
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < m_end && sp_k0(m_block) == 3; ++m_block) { bwd_step(m_block, mask_fn, cute::Int<3>{}); }
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < m_end; ++m_block) { bwd_step(m_block, mask_fn, cute::Int<4>{}); }
+            }
+        };
+
         // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
         // this helps quite a bit to not have to do causal masking for most of the iterations.
         if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
             auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
             static constexpr int kBlockM = get<0>(TileShape_MNK{});
             int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < std::min(m_block_max, m_block_masking_max); ++m_block) {
-                bwd_step(m_block, mask_fn);
-            }
+            run_steps(std::min(m_block_max, m_block_masking_max), mask_fn);
         }
 
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1019,17 +1116,11 @@ struct CollectiveMainloopBwdSm90 {
             : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
 
         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
-        CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block < m_block_max_before_local_mask; ++m_block) {
-            bwd_step(m_block, mask_fn);
-        }
+        run_steps(m_block_max_before_local_mask, mask_fn);
 
         if constexpr (Is_local && SeparateMaskingIterations) {
             auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < m_block_max; ++m_block) {
-                bwd_step(m_block, mask_fn);
-            }
+            run_steps(m_block_max, mask_fn);
         }
 
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print_tensor(tdVrdV); }

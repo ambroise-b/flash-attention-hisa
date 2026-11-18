@@ -661,7 +661,12 @@ if not SKIP_CUDA_BUILD:
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]
     sources += ["flash_prepare_scheduler.cu"]
-    nvcc_flags = [
+    if not DISABLE_HDIM64:  # sparse_rope block rule (separate kernels)
+        sources += ["instantiations/flash_fwd_hdim64_bf16_sparse_sm90.cu",
+                    "instantiations/flash_fwd_hdim64_bf16_sparse_decode_sm90.cu"]
+        if not DISABLE_BACKWARD:
+            sources += ["instantiations/flash_bwd_hdim64_bf16_sparse_sm90.cu"]
+    nvcc_flags = os.getenv("FA3_EXTRA_NVCC_FLAGS", "").split() + [  # sparse_rope: experiment defines
         "-O3",
         "-std=c++17",
         "--ftemplate-backtrace-limit=0",  # To debug template code

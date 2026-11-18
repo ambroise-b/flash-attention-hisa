@@ -10,6 +10,8 @@
 #include "cutlass/kernel_launch.h"  // For kernel_launch
 #include "cutlass/cluster_launch.hpp"  // For ClusterLauncher
 
+#include <stdexcept>
+
 #include "cuda_check.h"
 #include "static_switch.h"
 #include "flash.h"
@@ -29,7 +31,7 @@ template <int Arch, int kHeadDim, int kBlockM, int kBlockN, typename Element,
           int Stages_dO=2, int Stages_dS_or_QSm80=2,
           bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
           int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-          bool V_in_regs=false>
+          bool V_in_regs=false, bool Sparse=false>
 void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using ElementAccum = float;
@@ -83,7 +85,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         Arch >= 90,
         flash::CollectiveMainloopBwdSm90<Stages, Stages_dO, Stages_dS, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
-            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>,
+            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Sparse>,
         flash::CollectiveMainloopBwdSm80<Stages, Stages_dO, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm80,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
             SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>
@@ -131,7 +133,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q, params.cu_seqlens_k,
-        params.seqused_q, params.seqused_k
+        params.seqused_q, params.seqused_k,
+        params.sparse_a_ptr, params.sparse_n_table, params.sparse_rule_block
     };
     // The case work with GQA is ugly but idk how to fix it.
     typename CollectiveEpilogue::Arguments epilogue_args {
@@ -294,14 +297,20 @@ template<int Arch, typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_c
          int Stages_dO=2, int Stages_dS_or_QSm80=2,
          bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
          int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-         bool V_in_regs=false>
+         bool V_in_regs=false, bool Sparse=false>
 void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
     VARLEN_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
             BOOL_SWITCH(params.deterministic, Deterministic_, [&] {
                 static constexpr bool Deterministic = Deterministic_ && kHeadDim < 256;
                 // run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen, false, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
-                run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, Deterministic /*Deterministic*/, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>(params, stream);
+                if constexpr (!Sparse) {
+                    run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, Deterministic /*Deterministic*/, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>(params, stream);
+                } else if constexpr (!Varlen && !Deterministic) {
+                    run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, false, false, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, true>(params, stream);
+                } else {
+                    throw std::runtime_error("sparse_rope block rule: no varlen / deterministic backward");
+                }
             });
         });
     });
